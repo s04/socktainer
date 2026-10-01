@@ -1,5 +1,7 @@
 name: Contribution validation
 on:
+  push:
+    branches: [contribution-validation]
   workflow_dispatch:
     inputs:
       patch:
@@ -13,6 +15,7 @@ permissions:
   contents: read
 jobs:
   tests:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: macos-26
     timeout-minutes: 55
     steps:

@@ -10,6 +10,10 @@ on:
       name:
         description: Validation label
         required: true
+      runtime:
+        description: Attempt Apple Container smoke tests
+        type: boolean
+        default: false
 run-name: Validate ${{ inputs.name }}
 permissions:
   contents: read
@@ -54,3 +58,85 @@ jobs:
         run: make test
       - name: Release build
         run: make release
+      - name: Install Apple Container for runtime smoke tests
+        if: inputs.runtime
+        run: |
+          VERSION=$(python3 -c "import json; print(next(p['state']['version'] for p in json.load(open('Package.resolved'))['pins'] if p['identity']=='container'))")
+          curl -fsSL "https://github.com/apple/container/releases/download/$VERSION/container-installer-unsigned.pkg" -o /tmp/container.pkg
+          sudo installer -pkg /tmp/container.pkg -target /
+          brew install docker
+      - name: Start Apple Container
+        if: inputs.runtime
+        run: |
+          if ! sudo container system start --enable-kernel-install; then
+            PLIST="$(sudo find /var/root "$HOME" -maxdepth 6 -path '*/com.apple.container/apiserver/apiserver.plist' 2>/dev/null | head -1)"
+            test -n "$PLIST"
+            sudo launchctl bootstrap system "$PLIST"
+            sudo container system start --enable-kernel-install
+          fi
+          sudo container system status
+      - name: Exercise Docker compatibility regressions
+        if: inputs.runtime
+        run: |
+          nohup sudo -i "$PWD/.build/release/socktainer" > service.log 2>&1 &
+          python3 - <<'PYTEST'
+          import subprocess, time, json, pathlib
+          def docker(*args, timeout=120, check=True):
+              result = subprocess.run(['sudo', 'docker', '--host', 'unix:///var/root/.socktainer/container.sock', *args], text=True, capture_output=True, timeout=timeout)
+              print('docker', *args, flush=True)
+              print(result.stdout, result.stderr, flush=True)
+              if check and result.returncode:
+                  raise RuntimeError(f'docker failed: {result.returncode}')
+              return result
+          for _ in range(30):
+              if docker('version', check=False, timeout=15).returncode == 0:
+                  break
+              time.sleep(1)
+          else:
+              raise RuntimeError('socktainer did not become ready')
+          docker('pull', 'alpine:3.22')
+          for name in ['aa-one', 'aa-two', 'xx-other']:
+              docker('create', '--name', name, 'alpine:3.22', 'true')
+          assert docker('ps', '-a', '--filter', 'name=^/?(k3d-)?aa-one$', '--format', '{{.Names}}').stdout.strip() == 'aa-one'
+          assert set(docker('ps', '-a', '--filter', 'name=aa', '--format', '{{.Names}}').stdout.split()) == {'aa-one', 'aa-two'}
+          payload = pathlib.Path('/tmp/attach-payload.sh')
+          payload.write_text('#!/bin/sh\necho injected-ok\n')
+          for mode in ['-a', '-ai']:
+              name = 'copy-test' + mode.replace('-', '')
+              docker('create', '-i', '--name', name, 'alpine:3.22', '/bin/sh', '/payload.sh')
+              docker('cp', str(payload), name + ':/payload.sh')
+              assert 'injected-ok' in docker('start', mode, name).stdout
+              docker('rm', name)
+          image = 'rancher/k3s:v1.35.5-k3s1'
+          docker('pull', image, timeout=600)
+          expected = {'/var/lib/cni', '/var/lib/kubelet', '/var/lib/rancher/k3s', '/var/log'}
+          assert set(json.loads(docker('image', 'inspect', image, '--format', '{{json .Config.Volumes}}').stdout)) == expected
+          docker('create', '--name', 'volume-test', '--entrypoint', '/bin/sh', image, '-c', 'test -d /var/log && echo volume-ok')
+          mounts = json.loads(docker('inspect', 'volume-test', '--format', '{{json .Mounts}}').stdout)
+          assert {m['Destination'] for m in mounts if m['Type']=='volume'} == expected
+          names = [m['Name'] for m in mounts if m['Type']=='volume']
+          assert 'volume-ok' in docker('start', '-a', 'volume-test').stdout
+          docker('rm', '-v', 'volume-test')
+          for name in names:
+              assert docker('volume', 'inspect', name, check=False).returncode != 0
+          docker('volume', 'create', 'keep-named')
+          docker('create', '--name', 'override-test', '-v', 'keep-named:/var/log', '--entrypoint', '/bin/sh', image, '-c', 'true')
+          mounts = json.loads(docker('inspect', 'override-test', '--format', '{{json .Mounts}}').stdout)
+          assert len([m for m in mounts if m['Destination']=='/var/log']) == 1
+          assert next(m['Name'] for m in mounts if m['Destination']=='/var/log') == 'keep-named'
+          docker('rm', '-v', 'override-test')
+          docker('volume', 'inspect', 'keep-named')
+          before = set(docker('volume', 'ls', '-q').stdout.split())
+          docker('run', '--rm', '--entrypoint', '/bin/sh', image, '-c', 'test -d /var/log')
+          for _ in range(50):
+              after = set(docker('volume', 'ls', '-q').stdout.split())
+              if after == before:
+                  break
+              time.sleep(0.2)
+          assert after == before, (before, after)
+          PYTEST
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always() && inputs.runtime
+        with:
+          name: runtime-logs
+          path: service.log

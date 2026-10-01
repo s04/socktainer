@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: socktainer/socktainer
-          ref: 8f9a916
+          ref: 8f9a916271ebf575218ab1b6ed4d08522ebc15f2
       - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90
         with:
           xcode-version: latest-stable

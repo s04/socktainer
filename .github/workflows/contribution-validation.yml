@@ -1,0 +1,53 @@
+name: Contribution validation
+on:
+  workflow_dispatch:
+    inputs:
+      patch:
+        description: Base64 gzip patch against upstream main
+        required: true
+      name:
+        description: Validation label
+        required: true
+run-name: Validate ${{ inputs.name }}
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: macos-26
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: socktainer/socktainer
+          ref: 8f9a916
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90
+        with:
+          xcode-version: latest-stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .build
+          key: ${{ runner.os }}-contribution-spm-${{ hashFiles('**/Package.resolved') }}
+      - name: Apply proposed changes
+        env:
+          PROPOSED_PATCH: ${{ inputs.patch }}
+        run: |
+          python3 - <<'PY'
+          import os, base64, gzip, subprocess
+          subprocess.run(['git', 'apply'], input=gzip.decompress(base64.b64decode(os.environ['PROPOSED_PATCH'])), check=True)
+          PY
+      - name: Format
+        run: make fmt
+      - name: Save formatted patch
+        if: always()
+        run: |
+          git add -N Sources Tests scripts
+          git diff --binary > formatted.patch
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: formatted-patch
+          path: formatted.patch
+      - name: Unit tests
+        run: make test
+      - name: Release build
+        run: make release
